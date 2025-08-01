@@ -5,7 +5,10 @@
 # Assumes Apache2 is already installed and running.
 
 # --- Configuration Variables ---
-# You might want to customize these before running the script
+# You MUST customize these before running the script
+GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- **IMPORTANT: CHANGE THIS TO YOUR ACTUAL REPO URL**
+GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
+
 PYTHON_VENV_PATH="/opt/ap_controller_venv"
 FLASK_APP_DIR="/opt/ap_controller_app"
 APACHE_WEB_ROOT="/var/www/html/ap_controller_frontend" # Where your HTML/JS frontend will go
@@ -18,7 +21,7 @@ print_header() {
     echo " OpenWrt AP Controller Installer Script"
     echo "========================================================"
     echo "This script sets up the backend (Python Flask, SQLite) and MQTT broker."
-    echo "It assumes Apache2 is already installed for the frontend."
+    echo "It will also deploy your web frontend from GitHub."
     echo ""
 }
 
@@ -31,9 +34,9 @@ check_root() {
 }
 
 install_dependencies() {
-    echo "Installing system dependencies (Mosquitto, Python3, pip, venv)..."
+    echo "Installing system dependencies (Mosquitto, Python3, pip, venv, git)..."
     apt update
-    apt install -y mosquitto mosquitto-clients python3 python3-pip python3-venv sqlite3
+    apt install -y mosquitto mosquitto-clients python3 python3-pip python3-venv sqlite3 git
     if [ $? -ne 0 ]; then
         echo "Error installing system dependencies. Please check your internet connection and apt repositories."
         exit 1
@@ -113,11 +116,11 @@ def init_db():
                 ap_id TEXT PRIMARY KEY,
                 ip_address TEXT,
                 mac_address TEXT,
-                last_checkin TIMESTAMP,
+                last_checkin REAL, -- Use REAL for Unix timestamp floats
                 status TEXT,
                 location TEXT,
                 current_ssid TEXT,
-                current_password TEXT,
+                current_password TEXT, -- Consider encryption for this field!
                 connected_devices INTEGER DEFAULT 0,
                 wifi_strength REAL,
                 channel INTEGER,
@@ -150,7 +153,7 @@ def on_message(client, userdata, msg):
         ap_id = topic_parts[1]
         metric_type = topic_parts[2]
         payload = msg.payload.decode('utf-8')
-        print(f"Received from {ap_id} ({metric_type}): {payload}")
+        # print(f"Received from {ap_id} ({metric_type}): {payload}") # Uncomment for verbose logging
 
         with sqlite3.connect(DB_PATH) as conn:
             cursor = conn.cursor()
@@ -173,10 +176,10 @@ def on_message(client, userdata, msg):
                 update_fields['ip_address'] = payload
             elif metric_type == "config_ack":
                 print(f"AP {ap_id} config ACK: {payload}")
-                # You might add logic here to update UI or logs based on ACK
+                # Future: Update a 'last_config_ack' field or status in DB
             elif metric_type == "reboot_ack":
                 print(f"AP {ap_id} reboot ACK: {payload}")
-                # You might add logic here to update UI or logs based on ACK
+                # Future: Update a 'last_reboot_ack' field or status in DB
 
             if update_fields:
                 set_clause = ", ".join([f"{k} = ?" for k in update_fields.keys()])
@@ -196,7 +199,8 @@ mqtt_client.loop_start() # Start non-blocking loop in background
 # --- Flask Routes ---
 @app.route('/')
 def index():
-    return "AP Controller Backend is running. Access frontend via Apache."
+    # This route is mainly for internal testing of Flask. Apache will handle the actual /
+    return "AP Controller Backend is running. Access frontend via Apache at the server's IP."
 
 @app.route('/api/aps', methods=['GET', 'POST'])
 def manage_aps():
@@ -368,22 +372,59 @@ sys.path.insert(0, '$FLASK_APP_DIR')
 from app import app as application
 EOF
 
-    # Initialize the database
+    # Initialize the database (creates the .db file and table)
     source "$PYTHON_VENV_PATH/bin/activate"
-    python "$FLASK_APP_DIR/app.py" # Run once to create db file
+    python -c "from app import init_db; init_db()" # Call init_db directly
     deactivate
 
     echo "Flask application setup complete."
 }
 
+deploy_frontend_files() {
+    echo "Deploying frontend files from GitHub..."
+    local TEMP_CLONE_DIR="/tmp/osap_clone_$(date +%s)"
+
+    # Create frontend directory if it doesn't exist
+    mkdir -p "$APACHE_WEB_ROOT"
+
+    echo "Cloning repository: $GITHUB_REPO_URL branch: $GITHUB_REPO_BRANCH into $TEMP_CLONE_DIR"
+    git clone --depth 1 --branch "$GITHUB_REPO_BRANCH" "$GITHUB_REPO_URL" "$TEMP_CLONE_DIR"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to clone the GitHub repository. Check URL, branch, and network connectivity."
+        exit 1
+    fi
+
+    echo "Copying frontend files from $TEMP_CLONE_DIR/web/ to $APACHE_WEB_ROOT"
+    if [ ! -d "$TEMP_CLONE_DIR/web" ]; then
+        echo "Error: 'web/' directory not found in the cloned repository."
+        echo "Please ensure your GitHub repo structure matches: OSAP/web/index.php, etc."
+        rm -rf "$TEMP_CLONE_DIR"
+        exit 1
+    fi
+
+    cp -r "$TEMP_CLONE_DIR/web/." "$APACHE_WEB_ROOT/"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to copy frontend files."
+        rm -rf "$TEMP_CLONE_DIR"
+        exit 1
+    fi
+
+    echo "Cleaning up temporary clone directory..."
+    rm -rf "$TEMP_CLONE_DIR"
+    echo "Frontend files deployed."
+}
+
 configure_apache() {
     echo "Configuring Apache2 for the controller frontend and backend proxy..."
 
-    # Create frontend directory
-    mkdir -p "$APACHE_WEB_ROOT"
-    echo "<h1>AP Controller Frontend (Placeholder)</h1><p>Your web interface files will go here.</p>" > "$APACHE_WEB_ROOT/index.html"
+    # Ensure Apache is configured to parse PHP files
+    if ! dpkg -l | grep -q "libapache2-mod-php"; then
+        echo "Installing libapache2-mod-php..."
+        apt install -y libapache2-mod-php php-cli
+    fi
+    a2enmod php* || true # Enable PHP module (might be php7.x, php8.x)
 
-    # Enable required Apache modules
+    # Enable required Apache modules for proxying
     a2enmod proxy proxy_http
     if [ $? -ne 0 ]; then
         echo "Error enabling Apache proxy modules. Check Apache2 installation."
@@ -408,7 +449,7 @@ configure_apache() {
     ErrorLog \${APACHE_LOG_DIR}/ap_controller_error.log
     CustomLog \${APACHE_LOG_DIR}/ap_controller_access.log combined
 
-    # Serve static frontend files
+    # Serve static frontend files (PHP, HTML, CSS, JS)
     <Directory $APACHE_WEB_ROOT>
         Options Indexes FollowSymLinks
         AllowOverride None
@@ -419,8 +460,13 @@ configure_apache() {
     ProxyPass /api/ http://127.0.0.1:$FLASK_PORT/api/
     ProxyPassReverse /api/ http://127.0.0.1:$FLASK_PORT/api/
 
-    # Optional: If you want to use mod_wsgi (more robust for production)
-    # Install with: sudo apt install libapache2-mod-wsgi-py3
+    # For PHP files, ensure handler is set
+    <FilesMatch \.php$>
+        SetHandler application/x-httpd-php
+    </FilesMatch>
+
+    # Optional: If you want to use mod_wsgi for Flask (more robust for production)
+    # This requires libapache2-mod-wsgi-py3 to be installed.
     # WSGIScriptAlias /api $FLASK_APP_DIR/wsgi.py
     # <Directory $FLASK_APP_DIR>
     #     WSGIMode process-group
@@ -477,6 +523,7 @@ check_root
 install_dependencies
 configure_mosquitto
 setup_flask_app
+deploy_frontend_files # <--- New step
 configure_apache
 create_systemd_service
 
@@ -484,9 +531,8 @@ echo "========================================================"
 echo "AP Controller Installation Complete!"
 echo "========================================================"
 echo "Next steps:"
-echo "1. Create your frontend HTML/CSS/JS files and place them in: $APACHE_WEB_ROOT"
-echo "2. Access your controller via web browser at your server's IP address."
-echo "3. Remember to secure your Mosquitto broker (authentication, SSL/TLS) for production!"
+echo "1. Access your controller via web browser at your server's IP address."
+echo "2. Remember to secure your Mosquitto broker (authentication, SSL/TLS) for production!"
 echo "   Refer to Mosquitto documentation for details: https://mosquitto.org/documentation/"
-echo "4. Consider using 'mod_wsgi' for a more robust Flask deployment with Apache2."
+echo "3. Consider using 'mod_wsgi' for a more robust Flask deployment with Apache2."
 echo ""
