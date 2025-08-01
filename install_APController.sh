@@ -6,7 +6,7 @@
 
 # --- Configuration Variables ---
 # You MUST customize these before running the script
-GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- **UPDATED TO YOUR REPO URL**
+GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- **YOUR REPO URL**
 GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
 
 PYTHON_VENV_PATH="/opt/ap_controller_venv"
@@ -497,6 +497,19 @@ EOF
     echo "Apache2 configured and restarted."
 }
 
+ensure_www_data_user() {
+    echo "Ensuring www-data user and group exist for Flask backend..."
+    if ! id -g www-data >/dev/null 2>&1; then
+        echo "Creating www-data group..."
+        addgroup --system www-data
+    fi
+    if ! id -u www-data >/dev/null 2>&1; then
+        echo "Creating www-data user..."
+        adduser --system --no-create-home --ingroup www-data --disabled-password --shell /usr/sbin/nologin www-data
+    fi
+    echo "www-data user and group ensured."
+}
+
 create_systemd_service() {
     echo "Creating systemd service for Flask backend..."
 
@@ -506,7 +519,7 @@ Description=AP Controller Flask Backend
 After=network.target mosquitto.service
 
 [Service]
-User=www-data # Or a more appropriate user, e.g., 'ap_user'
+User=www-data
 Group=www-data
 WorkingDirectory=$FLASK_APP_DIR
 ExecStart=$PYTHON_VENV_PATH/bin/python $FLASK_APP_DIR/app.py
@@ -533,6 +546,7 @@ configure_mosquitto
 setup_flask_app
 deploy_frontend_files
 configure_apache
+ensure_www_data_user # <--- This function ensures www-data exists
 create_systemd_service
 
 echo "========================================================"
