@@ -6,7 +6,7 @@
 
 # --- Configuration Variables ---
 # You MUST customize these before running the script
-GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- YOUR REPO URL (Corrected)
+GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- YOUR REPO URL
 GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
 
 PYTHON_VENV_PATH="/opt/ap_controller_venv"
@@ -412,12 +412,15 @@ deploy_frontend_files() {
         exit 1
     fi
 
+    # Fix: Closing brace for this if statement was missing
+    # Corrected below by ensuring the `if` is properly closed before the next line
     cp -r "$TEMP_CLONE_DIR/web/." "$APACHE_WEB_ROOT/"
     if [ $? -ne 0 ]; then
         echo "Error: Failed to copy frontend files."
         rm -rf "$TEMP_CLONE_DIR"
         exit 1
-    }
+    fi # <--- This `fi` was missing causing the syntax error on the next `}`
+    # This `fi` closes the `if [ $? -ne 0 ]` block
 
     echo "Cleaning up temporary clone directory..."
     rm -rf "$TEMP_CLONE_DIR"
