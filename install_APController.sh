@@ -6,7 +6,7 @@
 
 # --- Configuration Variables ---
 # You MUST customize these before running the script
-GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- **IMPORTANT: CHANGE THIS TO YOUR ACTUAL REPO URL**
+GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- **UPDATED TO YOUR REPO URL**
 GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
 
 PYTHON_VENV_PATH="/opt/ap_controller_venv"
@@ -50,6 +50,14 @@ configure_mosquitto() {
     # Backup existing mosquitto.conf
     cp /etc/mosquitto/mosquitto.conf /etc/mosquitto/mosquitto.conf.bak.$(date +%Y%m%d%H%M%S)
     echo "Backed up /etc/mosquitto/mosquitto.conf"
+
+    # Comment out persistence_location in main mosquitto.conf to avoid duplicates
+    echo "Commenting out persistence_location in main mosquitto.conf to avoid duplicates..."
+    sed -i '/^persistence_location/s/^/#/' /etc/mosquitto/mosquitto.conf
+
+    # Comment out log_dest file in main mosquitto.conf to avoid duplicates
+    echo "Commenting out log_dest file in main mosquitto.conf to avoid duplicates..."
+    sed -i '/^log_dest file/s/^/#/' /etc/mosquitto/mosquitto.conf
 
     # Minimal Mosquitto config for basic operation (NO AUTH/SSL by default for simplicity)
     # FOR PRODUCTION: STRONGLY RECOMMEND ADDING AUTHENTICATION AND SSL/TLS!
@@ -523,7 +531,7 @@ check_root
 install_dependencies
 configure_mosquitto
 setup_flask_app
-deploy_frontend_files # <--- New step
+deploy_frontend_files
 configure_apache
 create_systemd_service
 
