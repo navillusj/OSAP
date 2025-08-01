@@ -382,7 +382,8 @@ EOF
 
     # Initialize the database (creates the .db file and table)
     source "$PYTHON_VENV_PATH/bin/activate"
-    python -c "from app import init_db; init_db()" # Call init_db directly
+    # Change directory to Flask app directory before running Python command
+    (cd "$FLASK_APP_DIR" && python -c "from app import init_db; init_db()")
     deactivate
 
     echo "Flask application setup complete."
