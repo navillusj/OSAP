@@ -6,237 +6,7 @@
 
 # --- Configuration Variables ---
 # You MUST customize these before running the script
-GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- YOUR REPO URL
-GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
-
-PYTHON_VENV_PATH="/opt/ap_controller_venv"
-FLASK_APP_DIR="/opt/ap_controller_app"
-APACHE_WEB_ROOT="/var/www/html/ap_controller_frontend" # Where your HTML/JS frontend will go
-FLASK_PORT=5000 # Port for the Flask backend
-
-# --- Functions ---
-
-print_header() {
-    echo "========================================================"
-    echo " OpenWrt AP Controller Installer Script"
-    echo "========================================================"
-    echo "This script sets up the backend (Python Flask, SQLite) and MQTT broker."
-    echo "It will also deploy your web frontend from GitHub."
-    echo ""
-}
-
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "This script must be run as root."
-        echo "Please use 'sudo -i' or 'sudo bash $0'."
-        exit 1
-    fi
-}
-
-install_dependencies() {
-    echo "Installing system dependencies (Mosquitto, Python3, pip, venv, git)..."
-    apt update
-    apt install -y mosquitto mosquitto-clients python3 python3-pip python3-venv sqlite3 git
-    if [ $? -ne 0 ]; then
-        echo "Error installing system dependencies. Please check your internet connection and apt repositories."
-        exit 1
-    fi
-    echo "System dependencies installed."
-}
-
-configure_mosquitto() {
-    echo "Configuring Mosquitto MQTT Broker..."
-
-    # Backup existing mosquitto.conf
-    cp /etc/mosquitto/mosquitto.conf /etc/mosquitto/mosquitto.conf.bak.$(date +%Y%m%d%H%M%S)
-    echo "Backed up /etc/mosquitto/mosquitto.conf"
-
-    # Comment out persistence_location in main mosquitto.conf to avoid duplicates
-    echo "Commenting out persistence_location in main mosquitto.conf to avoid duplicates..."
-    sed -i '/^persistence_location/s/^/#/' /etc/mosquitto/mosquitto.conf
-
-    # Comment out log_dest file in main mosquitto.conf to avoid duplicates
-    echo "Commenting out log_dest file in main mosquitto.conf to avoid duplicates..."
-    sed -i '/^log_dest file/s/^/#/' /etc/mosquitto/mosquitto.conf
-
-    # Minimal Mosquitto config for basic operation (NO AUTH/SSL by default for simplicity)
-    # FOR PRODUCTION: STRONGLY RECOMMEND ADDING AUTHENTICATION AND SSL/TLS!
-    echo "
-listener 1883
-allow_anonymous true # WARNING: ONLY FOR DEVELOPMENT! Secure with authentication in production!
-
-# Persistence
-persistence true
-persistence_location /var/lib/mosquitto/
-
-# Logging
-log_dest file /var/log/mosquitto/mosquitto.log
-log_type all
-" > /etc/mosquitto/conf.d/default.conf # Use conf.d for easier management
-
-    systemctl restart mosquitto
-    systemctl enable mosquitto
-    echo "Mosquitto configured and restarted."
-}
-
-setup_flask_app() {
-    echo "Setting up Python Flask backend application..."
-
-    mkdir -p "$FLASK_APP_DIR"
-    mkdir -p "$PYTHON_VENV_PATH"
-    mkdir -p "$FLASK_APP_DIR/db" # Directory for SQLite database
-
-    # Create Python virtual environment
-    python3 -m venv "$PYTHON_VENV_PATH"
-    source "$PYTHON_VENV_PATH/bin/activate"
-
-    # Install Python packages
-    pip install Flask paho-mqtt
-    if [ $? -ne 0 ]; then
-        echo "Error installing Python packages. Check internet connection."
-        deactivate
-        exit 1
-    fi
-
-    # Create a basic Flask app.py
-    # This is a minimal example. You'd expand this with more complex logic.
-    cat << EOF > "$FLASK_APP_DIR/app.py"
-import os
-from flask import Flask, request, jsonify
-import paho.mqtt.client as mqtt
-import json
-import sqlite3
-import time
-
-app = Flask(__name__)
-
-# --- Configuration ---
-MQTT_BROKER_IP = "127.0.0.1" # Mosquitto runs on localhost
-MQTT_PORT = 1883
-FLASK_PORT = ${FLASK_PORT} # Define FLASK_PORT within app.py, using shell variable value
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'db', 'ap_controller.db')
-
-# --- Database Setup ---
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS access_points (
-                ap_id TEXT PRIMARY KEY,
-                ip_address TEXT,
-                mac_address TEXT,
-                last_checkin REAL, -- Use REAL for Unix timestamp floats
-                status TEXT,
-                location TEXT,
-                current_ssid TEXT,
-                current_password TEXT, -- Consider encryption for this field!
-                connected_devices INTEGER DEFAULT 0,
-                wifi_strength REAL,
-                channel INTEGER,
-                band TEXT,
-                notes TEXT
-            )
-        ''')
-        conn.commit()
-
-# --- MQTT Client ---
-mqtt_client = mqtt.Client()
-
-def on_connect(client, userdata, flags, rc):
-    print(f"MQTT Connected with result code {rc}")
-    # Subscribe to all AP status topics
-    client.subscribe("ap/+/status")
-    client.subscribe("ap/+/connected_devices")
-    client.subscribe("ap/+/wifi_strength")
-    client.subscribe("ap/+/ip_address")
-    client.subscribe("ap/+/config_ack")
-    client.subscribe("ap/+/reboot_ack")
-
-def on_message(client, userdata, msg):
-    try:
-        topic_parts = msg.topic.split('/')
-        if len(topic_parts) < 3:
-            print(f"Malformed topic: {msg.topic}")
-            return
-
-        ap_id = topic_parts[1]
-        metric_type = topic_parts[2]
-        payload = msg.payload.decode('utf-8')
-        # print(f"Received from {ap_id} ({metric_type}): {payload}") # Uncomment for verbose logging
-
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            # Ensure AP exists in DB or add it
-            cursor.execute("INSERT OR IGNORE INTO access_points (ap_id, status, last_checkin) VALUES (?, ?, ?)",
-                           (ap_id, 'online', time.time()))
-
-            update_fields = {}
-            if metric_type == "status":
-                update_fields['status'] = payload
-                update_fields['last_checkin'] = time.time()
-            elif metric_type == "connected_devices":
-                update_fields['connected_devices'] = int(payload)
-            elif metric_type == "wifi_strength":
-                try:
-                    update_fields['wifi_strength'] = float(payload)
-                except ValueError:
-                    update_fields['wifi_strength'] = None # Store as NULL if invalid
-            elif metric_type == "ip_address":
-                update_fields['ip_address'] = payload
-            elif metric_type == "config_ack":
-                print(f"AP {ap_id} config ACK: {payload}")
-                # Future: Update a 'last_config_ack' field or status in DB
-            elif metric_type == "reboot_ack":
-                print(f"AP {ap_id} reboot ACK: {payload}")
-                # Future: Update a 'last_reboot_ack' field or status in DB
-
-            if update_fields:
-                set_clause = ", ".join([f"{k} = ?" for k in update_fields.keys()])
-                values = list(update_fields.values())
-                values.append(ap_id)
-                cursor.execute(f"UPDATE access_points SET {set_clause} WHERE ap_id = ?", values)
-            conn.commit()
-
-    except Exception as e:
-        print(f"Error processing MQTT message: {e}")
-
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-mqtt_client.connect(MQTT_BROKER_IP, MQTT_PORT, 60)
-mqtt_client.loop_start() # Start non-blocking loop in background
-
-# --- Flask Routes ---
-@app.route('/')
-def index():
-    # This route is mainly for internal testing of Flask. Apache will handle the actual /
-    return "AP Controller Backend is running. Access frontend via Apache at the server's IP."
-
-@app.route('/api/aps', methods=['GET', 'POST'])
-def manage_aps():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row # Return rows as dictionaries
-        cursor = conn.不斷重複地執行：
-  1. 思考使用者意圖
-  2. 規劃多個步驟來滿足使用者意圖
-  3. 執行必要的工具，並收集其輸出
-  4. 根據工具輸出調整或重新規劃步驟
-  5. 響應使用者
-如果工具執行後有錯誤，則報告錯誤，但不要停止執行，除非已沒有其他選項。
-執行以下步驟來滿足使用者要求：
-1. 為使用者提供完整的 `install_APController.sh` 腳本的最新版本。
-
-執行步驟：
-1. 回覆使用者完整的腳本。
-```bash
-#!/bin/bash
-
-# install_APController.sh
-# Sets up the OpenWrt AP Controller on a Linux x86 server.
-# Assumes Apache2 is already installed and running.
-
-# --- Configuration Variables ---
-# You MUST customize these before running the script
-GITHUB_REPO_URL="[https://github.com/navillusj/OSAP.git](https://github.com/navillusj/OSAP.git)" # <--- YOUR REPO URL
+GITHUB_REPO_URL="https://github.com/navillusj/OSAP.git" # <--- YOUR REPO URL (Corrected)
 GITHUB_REPO_BRANCH="main" # Or 'master' or your specific branch name
 
 PYTHON_VENV_PATH="/opt/ap_controller_venv"
@@ -647,7 +417,7 @@ deploy_frontend_files() {
         echo "Error: Failed to copy frontend files."
         rm -rf "$TEMP_CLONE_DIR"
         exit 1
-    fi
+    }
 
     echo "Cleaning up temporary clone directory..."
     rm -rf "$TEMP_CLONE_DIR"
@@ -697,8 +467,8 @@ configure_apache() {
     </Directory>
 
     # Proxy API requests to the Flask backend
-    ProxyPass /api/ [http://127.0.0.1](http://127.0.0.1):$FLASK_PORT/api/
-    ProxyPassReverse /api/ [http://127.0.0.1](http://127.0.0.1):$FLASK_PORT/api/
+    ProxyPass /api/ http://127.0.0.1:$FLASK_PORT/api/
+    ProxyPassReverse /api/ http://127.0.0.1:$FLASK_PORT/api/
 
     # For PHP files, ensure handler is set
     <FilesMatch \.php$>
@@ -787,6 +557,6 @@ echo "========================================================"
 echo "Next steps:"
 echo "1. Access your controller via web browser at your server's IP address."
 echo "2. Remember to secure your Mosquitto broker (authentication, SSL/TLS) for production!"
-echo "   Refer to Mosquitto documentation for details: [https://mosquitto.org/documentation/](https://mosquitto.org/documentation/)"
+echo "   Refer to Mosquitto documentation for details: https://mosquitto.org/documentation/"
 echo "3. Consider using 'mod_wsgi' for a more robust Flask deployment with Apache2."
 echo ""
